@@ -1,0 +1,504 @@
+#include <AccelStepperWithDistance.h>  // Para control de Motores a pasos
+#include <ESP32SPISlave.h>             // Para comunicación SPI como esclavo13
+#include <HX711.h>                     // Para las celdas de carga
+#include "esp_task_wdt.h"
+
+//Pin de paro
+#define PinParo 4
+
+// Pin para el electroimán (controlado por MOSFET)
+#define EM_Pin 2
+
+// Pines para el HX711 (celdas de carga)
+#define LCApi_DO 34
+#define LCApi_SCK 33
+
+#define LCCaf_DO 35
+#define LCCaf_SCK 32
+
+#define LCMed_DO 36
+#define LCMed_SCK 27
+
+#define LCBan_DO 39
+#define LCBan_SCK 26
+
+#define FdCX 15
+#define FdCY 25 
+
+// Creación de objetos
+ESP32SPISlave slave;
+//El orden es: Interfaz, step, direc
+AccelStepperWithDistance stepperX(1, 21,22);
+AccelStepperWithDistance stepperY(1, 16,17);
+
+HX711 LC_Api;
+HX711 LC_Caf;
+HX711 LC_Med;
+HX711 LC_Ban;
+
+// Handles para las tareas
+TaskHandle_t taskMotorsHandle = NULL;
+TaskHandle_t taskSPIHandle = NULL;
+TaskHandle_t taskLoadCellsHandle = NULL;
+
+#define SPI_TRANSACTION_SIZE 8
+
+// Buffer para comunicación SPI
+uint8_t spi_slave_tx_buf[SPI_TRANSACTION_SIZE] = {0};
+uint8_t spi_slave_rx_buf[SPI_TRANSACTION_SIZE] = {};
+
+// Variables para celdas de carga
+int CantApi = 0;
+int CantCaf = 0;
+int CantMed = 0;
+int CantBan = 0;
+int CantAlm = 0;
+
+int CantApiOLD = 0;
+
+float PesoCaja = 16;
+
+// Variables para Motores
+volatile int Estado = 1;
+volatile int Anterior = 0;
+//volatile bool Espera = true;
+
+volatile bool systemPaused = false;
+bool notorigen = true;
+
+//volatile bool EM_State = false;
+
+uint8_t Storage_Zone = 0;
+int CantSZ = 0;
+
+uint8_t ActCam = 0;
+uint8_t Termine = 0;
+uint8_t Espera = 1;
+
+bool VFdCX = false;
+bool VFdCY = false;
+
+uint8_t Start = 0;
+
+int flagTime = 1000;
+int currentTime = 0;
+int Cont = 0;
+int ContA = 0;
+volatile int ContO = 0;
+
+portMUX_TYPE synch = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR Pausa() {
+  portENTER_CRITICAL(&synch);
+  if(Estado != 0){
+    Anterior = Estado;
+    Estado = 0;
+  }
+  systemPaused = !systemPaused;
+  portEXIT_CRITICAL(&synch);
+}
+
+// Función para el control de Motores y electroimán (Core 0)
+void taskMotors(void *pvParameters) {
+
+  esp_task_wdt_add(NULL);
+  // Configuración de los Motores
+  stepperX.setMaxSpeed(1500); //1500
+  stepperX.setAcceleration(1000); //500
+  stepperX.setStepsPerRotation(200);   // 1.8° stepper motor
+  stepperX.setDistancePerRotation(40);  // 2mm per rotation
+  stepperX.setAnglePerRotation(360);   // Standard 360° per rotation
+
+  stepperY.setMaxSpeed(1100); //1100
+  stepperY.setAcceleration(400); //400
+  stepperY.setStepsPerRotation(200);   // 1.8° stepper motor
+  stepperY.setDistancePerRotation(8);  // 2mm per rotation HAY QUE REVISARLO EXPERIMENTALMENTE, PUEDE SER 8 CON 6MM DE RADIO
+  stepperY.setAnglePerRotation(360);   // Standard 360° per rotation
+
+  stepperX.setCurrentPosition(0.0);
+  stepperY.setCurrentPosition(0.0);
+
+  while(Start != 1){
+    Estado = 1;
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_task_wdt_reset();
+  }
+
+  while(notorigen){
+    VFdCX = (digitalRead(FdCX) == HIGH);
+    VFdCY = (digitalRead(FdCY) == HIGH);
+    if(VFdCX && VFdCY){
+      stepperY.stop();
+      stepperX.stop();
+      stepperY.setCurrentPosition(0.0);
+      stepperX.setCurrentPosition(0.0);
+      Termine = 1;
+      Cont = 0;
+      ContA = 0;
+      notorigen = false;
+    }
+    else if(!VFdCX && VFdCY){
+      stepperY.stop();
+      stepperX.moveRelative(-350.0);
+      stepperX.run();
+    }
+    else{
+      stepperY.moveRelative(1000.0);
+      stepperY.run();
+    }
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+
+  // Configuración del proceso de apilado
+  while (true) {
+    switch (Estado) {
+      case 0:
+        if (systemPaused) {
+          Estado = 0;
+        } 
+        else {
+          Estado = Anterior;
+        }
+        break;
+      case 1:
+        if(Cont == 0){
+          Estado = 1;
+          currentTime = millis();
+          while(millis()-currentTime <= 500){
+            Estado = 1;
+            Cont = 0;
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          Cont = 1;
+          ContA = (CantApi == 0) ? 0 : 1;
+        }
+        else if(Espera){
+          Estado = 1;
+        }
+        else if(ContA == 0){
+          Estado = 1;
+          currentTime = millis();
+          while(millis()-currentTime <= 5000){
+            ContA = 0;
+            Estado = 1;
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          ContA = 1;
+        }
+        else if(-1.0*stepperY.getCurrentPositionDistance() >= (((CantApi == 0) ? 0.0 : 336.0 ) - CantApi * 50.0)){
+          digitalWrite(EM_Pin, HIGH);
+          Estado = 2;
+        }
+        else{
+          stepperY.run();
+          stepperY.moveToDistance(-337.0 + CantApi * 50.0);  //Revisar distancia total, puede ser hasta dejar 2 cm por encima de 5 cajas apiladas
+          stepperY.run();
+          Estado = 1;
+        }
+        stepperY.run();
+        break;
+      case 2:
+        if(-1.0*stepperY.getCurrentPositionDistance() <= 0.0){
+          ActCam = true;
+          Termine = 0;
+          currentTime = millis();
+          while(millis()-currentTime <= 250){
+            Estado = 2;
+            ActCam = true;
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          Estado = 3;
+          Cont = 0;
+          ContA = 0;
+        }
+        else{
+          stepperY.run();
+          stepperY.moveToDistance(0.5);
+          stepperY.run();
+          Estado = 2;
+        }
+        stepperY.run();
+        break;
+      case 3:
+        if(Espera){
+          Estado = 3;
+        }
+        else if(stepperX.getCurrentPositionDistance() >= (((Storage_Zone == 0) ? 0.0 : 28.0) + (float)Storage_Zone * 90.0)){
+          ActCam = false;
+          Estado = 4;
+        }
+        else{
+          stepperX.run();
+          stepperX.moveToDistance(28.5 + (float)Storage_Zone * 90.0);  //Formula por geogebra de una recta para las tres coordenadas
+          stepperX.run();
+          Estado = 3;
+        }
+        stepperX.run();
+        break;
+      case 4:
+        switch (Storage_Zone) {
+          case 1:
+            CantSZ = CantCaf;
+            break;
+          case 2:
+            CantSZ = CantMed;
+            break;
+          case 3:
+            CantSZ = CantBan;
+            break;
+          default:
+            CantSZ = CantApi;
+            break;
+        }
+        if(-1.0*stepperY.getCurrentPositionDistance() >= (282.5 - CantSZ * 50)){
+          digitalWrite(EM_Pin, LOW);
+          Estado = 5;
+        }
+        else{
+          stepperY.run();
+          stepperY.moveToDistance(-283.0 + CantSZ * 50);  //Revisar distancia total, puede ser hasta dejar 2 cm por encima de 5 cajas apiladas
+          stepperY.run();
+          Estado = 4;
+        }
+        stepperY.run();
+        break;
+      case 5:
+        if(-1.0*stepperY.getCurrentPositionDistance() <= 0.0){
+          Termine = 1;
+          Estado = 6;
+        }
+        else{
+          stepperY.run();
+          stepperY.moveToDistance(0.5);
+          stepperY.run();
+          Estado = 5;
+        }
+        stepperY.run();
+        break;
+      case 6:
+        if(stepperX.getCurrentPositionDistance() <= 0.0){
+          Estado = 1;
+        }
+        else{
+          stepperX.run();
+          stepperX.moveToDistance(-0.5);
+          stepperX.run();
+          Estado = 6;
+        }
+        stepperX.run();
+        break;
+    }
+    // Pequeña pausa para no saturar el CPU
+    vTaskDelay(pdMS_TO_TICKS(1));      // cede CPU
+    esp_task_wdt_reset();             // refresca watchdog
+  }
+}
+
+// Empaqueta tus 13 bits en el byte 0 y parte de byte 1
+void prepareTransmitSPIData() {
+  // limpia todo el buffer
+  //memset(spi_slave_tx_buf, 0, sizeof(spi_slave_tx_buf));
+
+  uint16_t packet = 0x00;
+
+  // CantApi: 3 bits en [2:0]
+  packet |= (uint16_t)((uint8_t)CantApi & 0x07) << 0;
+
+  // CantCaf: 3 bits en [5:3]
+  packet |= (uint16_t)((uint8_t)CantCaf & 0x07) << 3;
+
+  // CantMed: 3 bits en [8:6]
+  packet |= (uint16_t)((uint8_t)CantMed & 0x07) << 6;
+
+  // CantBan: 3 bits en [11:9]
+  packet |= (uint16_t)((uint8_t)CantBan & 0x07) << 9;
+
+  // ActCam: 1 bit en [12]
+  if (ActCam){
+    packet |= 1 << 12;
+  }
+  else{packet |= 0 << 12;}
+
+  if (Termine){
+    packet |= 1 << 13;
+  }
+  else{packet |= 0 << 13;}
+
+  // Señal de que los datos están listos (bit 7 del segundo byte)
+  uint8_t MSB = (packet >> 8) & 0x7F;
+  MSB |= 0b10000000;
+  
+  // Divide el word en dos bytes para SPI
+  spi_slave_tx_buf[0] = packet & 0xFF;         // bits  7:0
+  spi_slave_tx_buf[1] = MSB;  // bits 15:8 (solo usamos hasta el bit 12)
+}
+
+void processReceivedSPIData() {
+  // Transacción de 2 bytes simultáneos
+
+  uint8_t byte0 = spi_slave_rx_buf[0];
+
+    // Bits [1:0] → Storage_Zone
+  Storage_Zone = byte0 & 0x03;
+    // Bit [2] → Espera
+  Espera = (byte0 >> 2) & 0x01;
+  
+  Start = (byte0 >> 3) & 0x01;
+}
+
+// Función para la comunicación SPI con Raspberry Pi (Core 1)
+void taskSPI(void *pvParameters) {
+
+  // Inicialización de la comunicación SPI en modo esclavo
+  slave.setDataMode(SPI_MODE0);
+  slave.begin(VSPI, 18, 19, 23, 5);
+  
+
+  // Limpieza inicial de buffers
+  memset(spi_slave_tx_buf, 0, sizeof(spi_slave_tx_buf));
+  memset(spi_slave_rx_buf, 0, sizeof(spi_slave_rx_buf));
+
+  while (true) {
+    //1) Prepara los datos para enviar
+    prepareTransmitSPIData();
+
+    //2) Hace el intercambio
+    slave.transfer(spi_slave_tx_buf, spi_slave_rx_buf, SPI_TRANSACTION_SIZE);
+
+    //3) Procesa los datos recibidos
+    processReceivedSPIData();
+
+    // Dale un respiro al RTOS
+    vTaskDelay(pdMS_TO_TICKS(0.01));
+      
+  }
+}
+
+int countBoxes(float measured) {
+  float w_min = 13;
+  float w_max = 19;
+
+  int bestN = 0;
+  float bestDiff = fabs(measured - 0);  // para N=0
+
+  for (int N = 1; N <= 5; ++N) {
+    float minTotal = N * w_min;
+    float maxTotal = N * w_max;
+
+    // Si entra en el rango tolerado, lo devolvemos al instante
+    if (measured >= minTotal && measured <= maxTotal) {
+      return N;
+    }
+
+    // Si no entra, buscamos el N cuyo centro nominal esté más cerca
+    float center = N * PesoCaja;
+    float diff = fabs(measured - center);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestN = N;
+    }
+  }
+
+  return bestN;
+}
+
+// Función para procesar los datos de las celdas de carga (Core 1)
+void taskLoadCells(void *pvParameters) {
+
+  // Inicializar celdas de carga
+  LC_Api.begin(LCApi_DO, LCApi_SCK);
+  LC_Caf.begin(LCCaf_DO, LCCaf_SCK);
+  LC_Med.begin(LCMed_DO, LCMed_SCK);
+  LC_Ban.begin(LCBan_DO, LCBan_SCK);
+
+  // Factor de calibración (ajustar según calibración real)
+  float scaleApi = -400;
+  float scaleCaf = -350;
+  float scaleMed = 790;
+  float scaleBan = -400;
+
+  LC_Api.set_scale(scaleApi);
+  LC_Caf.set_scale(scaleCaf);
+  LC_Med.set_scale(scaleMed);
+  LC_Ban.set_scale(scaleBan);
+
+  // Tarar las celdas (asumiendo que no hay peso al inicio)
+  LC_Api.tare();  //Tenia 5 antes
+  LC_Caf.tare();
+  LC_Med.tare();
+  LC_Ban.tare();
+
+  while (true) {
+    // Lee peso y calcula número de cajas (0–5)
+    if((Estado == 1 || Estado == 2) && (stepperY.getCurrentPositionDistance() <= (-280.0 + CantApi * 50.0))){
+      //No hace nada;
+    }
+    else{
+      CantApi = countBoxes(LC_Api.get_units(3));
+    }
+    if((Estado == 4 || Estado == 5) && (stepperY.getCurrentPositionDistance() <= (-280.0 + CantApi * 50.0))){
+      //No hace nada;
+    }
+    else{
+      CantCaf = countBoxes(LC_Caf.get_units(3));
+      CantMed = countBoxes(LC_Med.get_units(3));
+      CantBan = countBoxes(LC_Ban.get_units(3));
+    }
+
+    // Pausa antes de la próxima lectura
+    vTaskDelay(pdMS_TO_TICKS(0.01));
+  }
+}
+
+
+void setup() {
+  // Iniciar comunicación serial para depuración
+  //Serial.begin(115200);
+  pinMode(EM_Pin, OUTPUT);
+  digitalWrite(EM_Pin, LOW);
+  pinMode(PinParo, INPUT);
+  pinMode(FdCX, INPUT_PULLDOWN);
+  pinMode(FdCY, INPUT_PULLDOWN);
+
+  // Crear las tareas en los cores específicos
+
+  // Core 1: Comunicación SPI
+  xTaskCreatePinnedToCore(
+    taskSPI,
+    "TaskSPI",
+    65536,
+    NULL,
+    2,
+    &taskSPIHandle,
+    1);
+
+  // Core 1: Procesamiento de celdas de carga
+  xTaskCreatePinnedToCore(
+    taskLoadCells,
+    "TaskLoadCells",
+    16384,
+    NULL,
+    1,
+    &taskLoadCellsHandle,
+    1);
+
+  // Core 0: Control de Motores y electroimán
+  xTaskCreatePinnedToCore(
+    taskMotors,         // Función que implementa la tarea
+    "TaskMotors",       // Nombre de la tarea
+    65536,               // Tamaño del stack (en palabras)
+    NULL,               // Parámetro de la tarea
+    1,                  // Prioridad de la tarea
+    &taskMotorsHandle,  // Task handle
+    0);                 // Core donde se ejecutará (0)
+
+  attachInterrupt(digitalPinToInterrupt(PinParo), Pausa, RISING);
+}
+
+void loop() {
+  // El loop principal puede quedar vacío ya que todo se maneja en las tareas
+}
